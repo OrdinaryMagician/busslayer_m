@@ -507,19 +507,19 @@ Class BusSlayerStats : HUDMessageBase
 			if ( !SlimFont ) SlimFont = Font.GetFont('STSM_LWR');
 			// line 1 of the disclaimer, variable named in reference to Marphy's two favourite words
 			String hackfraud = "This map is being played by an AI";
-			// position on screen (center-aligned 4 pixels off the top
-			pos.x = (CleanWidth-SlimFont.StringWidth(hackfraud))/2.;
-			pos.y = 4;
+			// position on screen
+			pos.x = (Screen.GetWidth()-SlimFont.StringWidth(hackfraud)*CleanXFac)/2.;
+			pos.y = 4*CleanYFac;
 			// because DTA_Clean works really weirdly, I'm using VirtualWidth/Height instead
-			Screen.DrawText(SlimFont,Font.CR_GOLD,pos.x,pos.y,hackfraud,DTA_VirtualWidth,CleanWidth,DTA_VirtualHeight,CleanHeight,DTA_KeepRatio,true);
+			Screen.DrawText(SlimFont,Font.CR_GOLD,pos.x,pos.y,hackfraud,DTA_CleanNoMove,true);
 			// line 2 has a gendered part (male, female, neutral/other, object)
 			static const String claimstr[] = {"he claims", "she claims", "they claim", "it claims"};
 			hackfraud = String.Format("%s\c- is a liar if %s otherwise",players[consoleplayer].GetUserName(),claimstr[players[consoleplayer].GetGender()]);
 			// again, text also centered
-			pos.x = (CleanWidth-SlimFont.StringWidth(hackfraud))/2.;
-			pos.y += SlimFont.GetHeight();
+			pos.x = (Screen.GetWidth()-SlimFont.StringWidth(hackfraud)*CleanXFac)/2.;
+			pos.y += SlimFont.GetHeight()*CleanYFac;
 			// same story here
-			Screen.DrawText(SlimFont,Font.CR_GOLD,pos.x,pos.y,hackfraud,DTA_VirtualWidth,CleanWidth,DTA_VirtualHeight,CleanHeight,DTA_KeepRatio,true);
+			Screen.DrawText(SlimFont,Font.CR_GOLD,pos.x,pos.y,hackfraud,DTA_CleanNoMove,true);
 		}
 		// debug text, toggleable through cvar too
 		if ( !busslayer_debug ) return;
@@ -568,12 +568,12 @@ Class BusSlayerStats : HUDMessageBase
 		// some nice colored text
 		debstr[1] = String.Format("%d \cdkills\c- %d \cdheals\c-",snkills,snheals);
 		// print 'em all at the bottom right, right above the status bar
-		pos.x = Screen.GetWidth()-(SmallFont.StringWidth(debstr[0])+4);
-		pos.y = bottom-(4+SmallFont.GetHeight()*2);
-		Screen.DrawText(SmallFont,Font.CR_GREEN,pos.x,pos.y,debstr[0]);
-		pos.x = Screen.GetWidth()-(SmallFont.StringWidth(debstr[1])+4);
-		pos.y += SmallFont.GetHeight();
-		Screen.DrawText(SmallFont,Font.CR_WHITE,pos.x,pos.y,debstr[1]);
+		pos.x = Screen.GetWidth()-(SmallFont.StringWidth(debstr[0])+4)*CleanXFac;
+		pos.y = bottom-(2+SmallFont.GetHeight()*2)*CleanYFac;
+		Screen.DrawText(SmallFont,Font.CR_GREEN,pos.x,pos.y,debstr[0],DTA_CleanNoMove,true);
+		pos.x = Screen.GetWidth()-(SmallFont.StringWidth(debstr[1])+4)*CleanXFac;
+		pos.y += SmallFont.GetHeight()*CleanYFac;
+		Screen.DrawText(SmallFont,Font.CR_WHITE,pos.x,pos.y,debstr[1],DTA_CleanNoMove,true);
 	}
 }
 
