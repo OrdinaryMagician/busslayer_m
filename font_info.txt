@@ -1,0 +1,11 @@
+Information:
+Name: Status Report
+Variants: 5
+Type: SmallFont
+Format: FON2
+Replaces: N/A
+Size: 7px
+Paletted: N/A
+Lower-cases: Yes
+Individual glyphs/character maps included: Yes
+Standard GFX included: N/A

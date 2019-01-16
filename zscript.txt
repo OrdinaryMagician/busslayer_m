@@ -1,0 +1,639 @@
+// this file contains all the scripting for the "Bus Slayer" AI
+// (C)2018-2019 Marisa Kirisame, UnSX Team
+// released under the Apache license (see COPYING.txt)
+version "3.7"
+
+// replacement fist, needed due to the fact A_ReFire doesn't work with tool-assisted input
+// this is only really needed to guarantee that the AI can punch as fast as a normal player
+class BusSlayerFist : Fist
+{
+	// rewritten refire function that first checks for AI input
+	action void A_BusSlayerReFire()
+	{
+		let slayer = BusSlayer(ThinkerIterator.Create("BusSlayer").Next());
+		bool pending;
+		if ( !player || !slayer ) return;
+		pending = ((player.PendingWeapon!=WP_NOCHANGE)&&(player.WeaponState&WF_REFIRESWITCHOK));
+		if ( slayer.usingfist && !pending && (player.health > 0) )
+		{
+			player.refire++;
+			player.mo.FireWeapon(null);
+		}
+		else player.refire = 0;
+		// call normal refire
+		A_ReFire();
+	}
+	States
+	{
+	Ready:
+		PUNG A 1 A_WeaponReady();
+		Loop;
+	Deselect:
+		PUNG A 1 A_Lower();
+		Loop;
+	Select:
+		PUNG A 1 A_Raise();
+		Loop;
+	Fire:
+		PUNG B 4;
+		PUNG C 4 A_Punch();
+		PUNG D 5;
+		PUNG C 4;
+		PUNG B 5 A_BusSlayerReFire();
+		Goto Ready;
+	}
+}
+
+// this static thinker stores the times the AI has healed or killed a revenant
+// in previously visited maps during the run
+Class BusSlayerSavedStats : Thinker
+{
+	int lheals, lkills;
+
+	static BusSlayerSavedStats Get()
+	{
+		let t = BusSlayerSavedStats(ThinkerIterator.Create("BusSlayerSavedStats",STAT_STATIC).Next());
+		if ( !t )
+		{
+			t = new("BusSlayerSavedStats");
+			t.ChangeStatNum(STAT_STATIC);
+		}
+		return t;
+	}
+}
+
+// the main AI actor in charge of controlling the player
+// it's all pretty straightforward (at least for me)
+// done as a separate actor from the playerpawn just for the sake of modularity
+Class BusSlayer : Actor
+{
+	// maximum turn speed
+	// a limit wouldn't normally be needed, but I added it to make
+	// movements a bit smoother to viewers
+	// (in a typical Doom TAS you can turn arbitrarily within a single tic)
+	const MAXTURN = 30.;
+
+	// main state for the AI
+	enum EBusState
+	{
+		BS_Unknown,		// something's screwy
+		BS_Driving,		// bus slayer's main routine. stay on the bus and watch out for revenants
+		BS_GettingOn,		// getting on the bus in the first map
+		BS_GettingWallet,	// getting the wallet on the fifth map
+		BS_Waiting		// waiting for the next bus on the last map, added just for fun
+	};
+	enum EBoardStage
+	{
+		BOARD_MoveSouth,	// first movement stage, player moves south to align with the bus door
+		BOARD_MoveToDoor	// move forward, opening the door when within range
+	};
+	enum EDriveStage
+	{
+		DRIVE_PressButan,	// player presses the button to start the bus
+		DRIVE_Fisting,		// main stage, stay in a strategic spot and fight revenants
+		DRIVE_Leaving,		// final stage, player moves towards the exit and leaves the bus (can fall back to previous stage if new revenants appear)
+		DRIVE_Panic		// player flails around. for the "plot twist" on the sixth map, added just for fun
+	};
+	enum EWalletStage
+	{
+		WALLET_MoveToOuthouse,	// player moves north aligning with the outhouse door, then moves forward, opening the door
+		WALLET_LeaveOuthouse,	// stage reached after picking up the wallet, player turns around and moves out the door
+		WALLET_MoveSouth,	// same as boarding stage of same name
+		WALLET_MoveToDoor	// ditto
+	};
+	EBusState BusState;
+	EBoardStage boardstage;
+	EDriveStage drivestage;
+	EWalletStage walletstage;
+	// multiplier for the turn speed used in the waiting state, mainly so the "looking at next bus" sequence looks much smoother
+	double csp;
+	// AI needs to heal
+	bool healing;
+	// the AI's own "fire button"
+	bool usingfist;
+	// flags set when a door has been successfully opened during either the boarding stage or the wallet stage (which is why this contains two bools)
+	// this is mainly so the use button is only pressed once
+	bool used[2];
+	// the player pawn this AI is controlling
+	PlayerPawn host;
+	// local number of heals and kills during this map, added to the static thinker before a map change
+	// these and the ones on the thinker will be added up together when printing debug stats
+	int nheals, nkills;
+
+	// set the initial state/stage at map load
+	override void PostBeginPlay()
+	{
+		Super.PostBeginPlay();
+		if ( level.levelnum == 1 )
+		{
+			BusState = BS_GettingOn;
+			BoardStage = BOARD_MoveSouth;
+		}
+		else if ( level.levelnum == 5 )
+		{
+			BusState = BS_GettingWallet;
+			WalletStage = WALLET_MoveToOuthouse;
+		}
+		else if ( level.levelnum == 7 )
+		{
+			BusState = BS_Waiting;
+		}
+		else if ( level.levelnum < 7 )
+		{
+			BusState = BS_Driving;
+			DriveStage = DRIVE_PressButan;
+		}
+	}
+	// stops all input when the host is dead
+	override void Tick()
+	{
+		if ( !host || (host.Health <= 0) )
+		{
+			if ( !InStateSequence(CurState,FindState("Death")) )
+				SetStateLabel("Death");
+		}
+		Super.Tick();
+	}
+	// default flags for the actor, it shouldn't interact with the world in any way
+	Default
+	{
+		+NOGRAVITY;
+		+NOBLOCKMAP;
+		+DONTSPLASH;
+	}
+	// checks if there are revenants in the bus and jumps to the attack state
+	bool LookForRevs()
+	{
+		let ti = ThinkerIterator.Create("RBLostSoul");
+		while ( target = Actor(ti.Next()) )
+		{
+			if ( target.Health <= 0 ) continue;
+			SetStateLabel("Attack");
+			return true;
+		}
+		target = null;
+		return false;
+	}
+	// for the "panic" event, targets a random revenant to look at
+	void PickRandomRevenant()
+	{
+		Array<Actor> RevUpThoseRevs;
+		let ti = ThinkerIterator.Create("Revenant");
+		Actor a;
+		while ( a = Actor(ti.Next()) )
+			RevUpThoseRevs.Push(a);
+		if ( Random[BusSlayer](0,3) ) target = null;
+		else target = RevUpThoseRevs[Random[BusSlayer](0,RevUpThoseRevs.Size()-1)];
+	}
+	// main function for revenant combat
+	// the AI will move towards the revenant to enter melee range, and back
+	// away if the revenant is attacking
+	// the AI will punch when in range until it has died
+	void A_AttackThink()
+	{
+		// if the target has died, count up kills and go back to driving
+		if ( !target || (target.Health <= 0) )
+		{
+			nkills++;
+			A_ClearTarget();
+			usingfist = false;
+			SetStateLabel("DriveBus");
+			return;
+		}
+		// press fire button when we can reach the target
+		if ( target && (target.Health > 0) && (host.Distance2D(target) <= DEFMELEERANGE) )
+		{
+			PushFire();
+			usingfist = true;
+		}
+		else usingfist = false;
+		if ( target && (target.Health > 0) )
+		{
+			// aim for the rev
+			LookTo(host.AngleTo(target),MAXTURN);
+			// don't move unless we're facing it, because diagonal movement is hard to script properly
+			if ( host.angle != host.AngleTo(target) )
+				return;
+			if ( target.InStateSequence(target.CurState,target.FindState("Melee")) )
+			{
+				// backpedal if too close
+				if ( target.CheckMeleeRange() )
+					PushVel(-1,0);
+			}
+			else
+			{
+				// move towards it
+				if ( !target.CheckMeleeRange() )
+					PushVel(1,0);
+			}
+		}
+	}
+	// initialization when the AI first spawns
+	// select the fist and then go to the appropriate state
+	void A_BusInit()
+	{
+		host.A_SelectWeapon("BusSlayerFist");
+		if ( BusState == BS_GettingOn )
+			SetStateLabel("BoardBus");
+		else if ( BusState == BS_GettingWallet )
+			SetStateLabel("WalletBus");
+		else if ( BusState == BS_Waiting )
+			SetStateLabel("WaitBus");
+		else if ( BusState == BS_Driving )
+			SetStateLabel("DriveBus");
+	}
+	// main movement routine for boarding the bus
+	void A_Boarding()
+	{
+		switch ( BoardStage )
+		{
+		case BOARD_MoveSouth:
+			// keep strafing left
+			PushVel(0,1);
+			// we'll align with the door if we release the key at this point
+			if ( host.pos.y <= 94 )
+				BoardStage++;
+			break;
+		case BOARD_MoveToDoor:
+			// keep moving forward
+			PushVel(1,0);
+			// press use ONCE to open the door
+			if ( (host.pos.x <= 128) && !used[0] )
+			{
+				PushUse();
+				used[0] = true;
+			}
+			break;
+		}
+	}
+	// are there available stimpacks at the back of the bus?
+	bool HasStimpaks()
+	{
+		let a = ThinkerIterator.Create("Stimpack").Next();
+		return !!a;
+	}
+	// are there available medikits at the back of the bus?
+	bool HasMedkits()
+	{
+		let a = ThinkerIterator.Create("Medikit").Next();
+		return !!a;
+	}
+	// smooth player aiming towards a certain angle
+	void LookTo( double ang, double str )
+	{
+		host.A_SetAngle(host.angle+clamp(DeltaAngle(host.angle,ang),-str,str),SPF_INTERPOLATE);
+		// account for floating point precision screwery
+		if ( DeltaAngle(host.angle,ang) ~== 0 ) host.angle = ang;
+	}
+	// emulate directional player movement
+	void PushVel( double x, double y )
+	{
+		host.vel += RotateVector((x,y),host.angle);
+		host.player.vel += RotateVector((x,y),host.angle);
+	}
+	// presses the fire button
+	// refire isn't handled correctly, which is why there's a custom fist weapon
+	void PushFire()
+	{
+		host.player.cmd.buttons |= BT_ATTACK;
+		// force the playerpawn to handle this button
+		host.CheckWeaponFire();
+	}
+	// presses the use button
+	void PushUse()
+	{
+		host.player.cmd.buttons |= BT_USE;
+		// force the playerpawn to handle this button
+		host.CheckUse();
+	}
+	// main bus driving routine, the largest of them all
+	void A_Driving()
+	{
+		switch ( DriveStage )
+		{
+		case DRIVE_PressButan:
+			if ( host.pos.y < -16 )
+			{
+				// turn north and move forward
+				if ( host.angle != 90 ) LookTo(90,MAXTURN);
+				else PushVel(1,0);
+			}
+			else
+			{
+				// aim for the button and then press it
+				if ( host.angle != 80 ) LookTo(80,MAXTURN);
+				else
+				{
+					PushUse();
+					DriveStage++;
+				}
+			}
+			break;
+		case DRIVE_Fisting:
+			// check for presence of revenants
+			// this function will set the state to "Attack", so we
+			// have to return early
+			if ( LookForRevs() ) break;
+			// eyes on the back of the bus
+			if ( host.angle != 270 ) LookTo(270,MAXTURN);
+			else if ( (host.Health <= 90) && HasStimpaks() )
+			{
+				// heal up with stimpacks
+				// medikits are ignored due to bad collision
+				healing = true;
+				if ( host.pos.y > -448 ) PushVel(1,0);
+				if ( (host.pos.y < -336) && (host.pos.x < 24) ) PushVel(0,1);
+			}
+			else
+			{
+				// count up heals
+				if ( healing ) nheals++;
+				healing = false;
+				// these move the player to a strategic spot
+				// perfect for waiting for revenants to pop up
+				if ( host.pos.y > -256 ) PushVel(1,0);
+				else if ( host.pos.y < -288 ) PushVel(-1,0);
+				if ( host.pos.x < 0 ) PushVel(0,min(1,abs(host.pos.x)*0.2));
+				else if ( host.pos.x > 0 ) PushVel(0,-min(1,abs(host.pos.x)*0.2));
+			}
+			// wait for the exit door to become reachable
+			// (sector #27 lowers)
+			if ( level.Sectors[27].floorplane.ZAtPoint((44,-12)) <= 32 )
+				DriveStage++;
+			break;
+		case DRIVE_Leaving:
+			// check for plot twist teleport
+			if ( host.pos.y < -10240 )
+			{
+				DriveStage++;
+				break;
+			}
+			// if there are still revenants left to fight
+			// interrupt the "leaving" stage and go fight them
+			if ( LookForRevs() ) break;
+			// player looks east
+			// then strafes left until the exit is reached
+			// afterwards, keep moving forward
+			if ( host.angle != 0 ) LookTo(0,MAXTURN);
+			else if ( host.pos.y < -24 ) PushVel(0,1);
+			else PushVel(1,0);
+			break;
+		case DRIVE_Panic:
+			// oh god what
+			PickRandomRevenant();
+			// too many creepy bones
+			if ( target && (host.angle != host.AngleTo(target)) )
+				LookTo(AngleTo(target),MAXTURN);
+			// help
+			PushVel(RandomPick[BusSlayer](-1,1),RandomPick[BusSlayer](-1,1));
+			break;
+		}
+	}
+	// routine for picking up the wallet
+	// last parts are identical to boarding
+	void A_Walleting()
+	{
+		switch ( WalletStage )
+		{
+		case WALLET_MoveToOuthouse:
+			// eyes on east
+			if ( host.angle != 0 ) LookTo(0,MAXTURN);
+			else
+			{
+				// strafe left, then move forward when aligned
+				if ( host.pos.y > 124 ) PushVel(0,-1);
+				PushVel(1,0);
+			}
+			// open the door
+			if ( (host.pos.x > 876) && !used[0] )
+			{
+				PushUse();
+				used[0] = true;
+			}
+			// wallet (replaces blue keycard) picked up
+			if ( host.CountInv("BlueCard") > 0 ) WalletStage++;
+			break;
+		case WALLET_LeaveOuthouse:
+			// eyes on west
+			// move away from outhouse
+			if ( host.angle != 180 ) LookTo(180,MAXTURN);
+			else if ( host.pos.x > 320 ) PushVel(1,0);
+			else WalletStage++;
+			break;
+		case WALLET_MoveSouth:
+			// move until aligned with bus door
+			PushVel(0,1);
+			if ( host.pos.y <= 56 ) WalletStage++;
+			break;
+		case WALLET_MoveToDoor:
+			// move forward and press use when needed
+			PushVel(1,0);
+			if ( (host.pos.x <= 128) && !used[1] )
+			{
+				PushUse();
+				used[1] = true;
+			}
+			break;
+		}
+	}
+	// simple routine for keeping the player's eyes on the incoming bus
+	void A_Waiting()
+	{
+		// aim vector towards the center of the bus
+		// it's a fixed spot because the player is actually being
+		// carried by a scrolling floor, giving the illusion that the
+		// bus is what's moving
+		Vector2 vto = level.Vec2Diff(host.pos.xy,(0,-1984)).unit();
+		// turned into an angle
+		double angto = atan2(vto.y,vto.x);
+		// aim for it
+		if ( angle != angto ) LookTo(angto,csp);
+		// gradually increase the turn speed for a smoother look
+		csp = min(MAXTURN,csp+0.03);
+	}
+	States
+	{
+	Spawn:
+		TNT1 A -1 NoDelay A_BusInit();
+		Stop;
+	BoardBus:
+		TNT1 A 1 A_Boarding();
+		Wait;
+	DriveBus:
+		TNT1 A 1 A_Driving();
+		Wait;
+	WalletBus:
+		TNT1 A 1 A_Walleting();
+		Wait;
+	WaitBus:
+		TNT1 A 1 A_Waiting();
+		Wait;
+	Attack:
+		TNT1 A 1 A_AttackThink();
+		Wait;
+	Death:
+		TNT1 A -1;	// RIP, shouldn't happen
+		Stop;
+	}
+}
+
+// HUD text for the AI stats
+// also includes a disclaimer (easily toggleable through a cvar anyway)
+// ZScript HUD Messages are kinda black magic to some, but for someone like me,
+// one of the people who eagerly waited for this feature, they're pretty
+// straightforward
+Class BusSlayerStats : HUDMessageBase
+{
+	// the AI instance in the map
+	BusSlayer slayer;
+	// fonts are non-serializable, welp
+	transient Font SlimFont;
+
+	// remove the message if there's no AI
+	override bool Tick()
+	{
+		if ( !slayer ) return true;
+		return false;
+	}
+
+	// per-frame draw function
+	override void Draw( int bottom, int visibility )
+	{
+		if ( !slayer ) return;
+		Vector2 pos;
+		if ( busslayer_disclaimer )
+		{
+			// load the disclaimer font
+			if ( !SlimFont ) SlimFont = Font.GetFont('STSM_LWR');
+			// line 1 of the disclaimer, variable named in reference to Marphy's two favourite words
+			String hackfraud = "This map is being played by an AI";
+			// position on screen (center-aligned 4 pixels off the top
+			pos.x = (CleanWidth-SlimFont.StringWidth(hackfraud))/2.;
+			pos.y = 4;
+			// because DTA_Clean works really weirdly, I'm using VirtualWidth/Height instead
+			Screen.DrawText(SlimFont,Font.CR_GOLD,pos.x,pos.y,hackfraud,DTA_VirtualWidth,CleanWidth,DTA_VirtualHeight,CleanHeight,DTA_KeepRatio,true);
+			// line 2 has a gendered part (male, female, neutral/other, object)
+			static const String claimstr[] = {"he claims", "she claims", "they claim", "it claims"};
+			hackfraud = String.Format("%s\c- is a liar if %s otherwise",players[consoleplayer].GetUserName(),claimstr[players[consoleplayer].GetGender()]);
+			// again, text also centered
+			pos.x = (CleanWidth-SlimFont.StringWidth(hackfraud))/2.;
+			pos.y += SlimFont.GetHeight();
+			// same story here
+			Screen.DrawText(SlimFont,Font.CR_GOLD,pos.x,pos.y,hackfraud,DTA_VirtualWidth,CleanWidth,DTA_VirtualHeight,CleanHeight,DTA_KeepRatio,true);
+		}
+		// debug text, toggleable through cvar too
+		if ( !busslayer_debug ) return;
+		// pretty printed string for the AI's current state/stage
+		// lots of if/else here like in a stereotypical AI :V
+		String statestr = "Unknown";
+		if ( slayer.CurState== slayer.FindState("Death") )
+			statestr = "Dead";
+		else if ( slayer.CurState == slayer.FindState("Attack") )
+			statestr = "Punching the Revenant";
+		else if ( slayer.BusState == BusSlayer.BS_Driving )
+		{
+			if ( slayer.DriveStage == BusSlayer.DRIVE_PressButan )
+				statestr = "Starting the bus";
+			else if ( slayer.DriveStage == BusSlayer.DRIVE_Leaving )
+				statestr = "Leaving the bus";
+			else if ( slayer.DriveStage == BusSlayer.DRIVE_Panic )
+				statestr = "OH GOD WHAT";
+			else if ( slayer.healing )
+				statestr = "Grabbing the health";
+			else
+				statestr = "Driving the bus";
+		}
+		else if ( slayer.BusState == BusSlayer.BS_GettingOn )
+			statestr = "Getting on the bus";
+		else if ( slayer.BusState == BusSlayer.BS_GettingWallet )
+		{
+			if ( slayer.WalletStage == BusSlayer.WALLET_MoveToOuthouse )
+				statestr = "Getting the wallet";
+			else statestr = "Returning to the bus";
+		}
+		else if ( slayer.BusState == BusSlayer.BS_Waiting )
+			statestr = "Waiting for the next bus";
+		// construct both lines of the debug text
+		String debstr[2];
+		debstr[0] = String.Format("%s",statestr);
+		// counters for kills and heals, first set to current map's
+		int snkills = slayer.nkills, snheals = slayer.nheals;
+		// add up the saved stats for previous maps in the static thinker
+		let hnd = BusSlayerDeployer(EventHandler.Find("BusSlayerDeployer"));
+		if ( hnd && hnd.saved )
+		{
+			snkills += hnd.saved.lkills;
+			snheals += hnd.saved.lheals;
+		}
+		// some nice colored text
+		debstr[1] = String.Format("%d \cdkills\c- %d \cdheals\c-",snkills,snheals);
+		// print 'em all at the bottom right, right above the status bar
+		pos.x = Screen.GetWidth()-(SmallFont.StringWidth(debstr[0])+4);
+		pos.y = bottom-(4+SmallFont.GetHeight()*2);
+		Screen.DrawText(SmallFont,Font.CR_GREEN,pos.x,pos.y,debstr[0]);
+		pos.x = Screen.GetWidth()-(SmallFont.StringWidth(debstr[1])+4);
+		pos.y += SmallFont.GetHeight();
+		Screen.DrawText(SmallFont,Font.CR_WHITE,pos.x,pos.y,debstr[1]);
+	}
+}
+
+// event handler in charge of deploying the AI and keeping ahold of the
+// static thinker for saved stats
+Class BusSlayerDeployer : EventHandler
+{
+	// the AI
+	BusSlayer TheSlayer;
+	// the stats
+	BusSlayerSavedStats saved;
+	// the debug message
+	ui BusSlayerStats statmsg;
+
+	// called after playsim tic, here we'll create the ui debug text and
+	// attach it to the hud once the AI is up
+	override void PostUiTick()
+	{
+		if ( !TheSlayer ) return;
+		// do this only once, obviously
+		if ( statmsg ) return;
+		statmsg = new("BusSlayerStats");
+		statmsg.Slayer = TheSlayer;
+		StatusBar.AttachMessage(statmsg,0,BaseStatusBar.HUDMSGLayer_OverHUD); // drawn over the normal HUD
+	}
+
+	// replace the standard fist with the AI-supported one when the player
+	// first loads in
+	override void PlayerEntered( PlayerEvent e )
+	{
+		let mo = players[e.playernumber].mo;
+		mo.TakeInventory("Fist",1);
+		mo.GiveInventory("BusSlayerFist",1);
+	}
+
+	// deploy the bus slayer on map load
+	override void WorldLoaded( WorldEvent e )
+	{
+		// don't do this when resuming a savegame
+		if ( e.IsSaveGame ) return;
+		// don't do this if we've already finished the wad
+		if ( level.levelnum > 7 ) return;
+		// get the saved stats (will be created if not existing)
+		saved = BusSlayerSavedStats.Get();
+		// spawn in the AI
+		TheSlayer = BusSlayer(Actor.Spawn("BusSlayer",(0,0,0)));
+		// attach the AI to the first player found
+		for ( int i=0; i<MAXPLAYERS; i++ )
+		{
+			if ( !playeringame[i] ) continue;
+			TheSlayer.host = players[i].mo;
+			break;
+		}
+	}
+
+	// save the current kill/heal stats to the thinker on map end
+	override void WorldUnloaded( WorldEvent e )
+	{
+		if ( !TheSlayer || !saved ) return;
+		saved.lheals += TheSlayer.nheals;
+		saved.lkills += TheSlayer.nkills;
+	}
+}

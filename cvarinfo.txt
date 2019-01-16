@@ -1,0 +1,4 @@
+// show AI state and stats debug text
+server noarchive bool busslayer_debug = false;
+// show "being played by an AI" disclaimer text
+server noarchive bool busslayer_disclaimer = true;
